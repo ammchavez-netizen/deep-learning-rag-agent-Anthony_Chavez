@@ -14,6 +14,7 @@ from __future__ import annotations
 from functools import lru_cache
 
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 
 from rag_agent.agent.nodes import (
@@ -71,8 +72,24 @@ generation_node  [END]   ← hallucination guard fires here
     >>> print(result["final_response"].answer)
     """
 
+    # Our own dataclasses are stored in the checkpoint (retrieved chunks and
+    # the final response). Newer LangGraph versions warn about — and will
+    # eventually block — deserialising types that are not allow-listed.
+    CHECKPOINT_TYPES = (
+        ("rag_agent.agent.state", "ChunkMetadata"),
+        ("rag_agent.agent.state", "RetrievedChunk"),
+        ("rag_agent.agent.state", "AgentResponse"),
+    )
+
     def __init__(self) -> None:
-        self._checkpointer = MemorySaver()
+        try:
+            serde = JsonPlusSerializer(
+                allowed_msgpack_modules=list(self.CHECKPOINT_TYPES)
+            )
+            self._checkpointer = MemorySaver(serde=serde)
+        except TypeError:
+            # Older LangGraph releases have no allow-list option (and no warning).
+            self._checkpointer = MemorySaver()
 
     def build(self):
         """
@@ -88,29 +105,27 @@ generation_node  [END]   ← hallucination guard fires here
         The compiled graph is thread-safe and can be shared across
         multiple Streamlit sessions via st.cache_resource.
         """
-        # TODO: implement
-        # 1. graph = StateGraph(AgentState)
-        #
-        # 2. Add nodes:
-        #    graph.add_node("query_rewrite", query_rewrite_node)
-        #    graph.add_node("retrieval", retrieval_node)
-        #    graph.add_node("generation", generation_node)
-        #
-        # 3. Add edges:
-        #    graph.add_edge(START, "query_rewrite")
-        #    graph.add_edge("query_rewrite", "retrieval")
-        #
-        # 4. Add conditional edge from retrieval:
-        #    graph.add_conditional_edges(
-        #        "retrieval",
-        #        should_retry_retrieval,
-        #        {"generate": "generation", "end": END}
-        #    )
-        #
-        # 5. graph.add_edge("generation", END)
-        #
-        # 6. return graph.compile(checkpointer=self._checkpointer)
-        raise NotImplementedError
+        graph = StateGraph(AgentState)
+
+        # Nodes: each one reads the shared state and returns fields to update.
+        graph.add_node("query_rewrite", query_rewrite_node)
+        graph.add_node("retrieval", retrieval_node)
+        graph.add_node("generation", generation_node)
+
+        # Fixed edges: rewrite the query, then retrieve.
+        graph.add_edge(START, "query_rewrite")
+        graph.add_edge("query_rewrite", "retrieval")
+
+        # Conditional edge: the router decides whether to generate or stop.
+        graph.add_conditional_edges(
+            "retrieval",
+            should_retry_retrieval,
+            {"generate": "generation", "end": END},
+        )
+
+        graph.add_edge("generation", END)
+
+        return graph.compile(checkpointer=self._checkpointer)
 
 
 @lru_cache(maxsize=1)

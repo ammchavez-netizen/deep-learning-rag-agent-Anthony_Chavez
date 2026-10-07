@@ -11,8 +11,15 @@ PEP 8 | OOP | Single Responsibility
 
 from __future__ import annotations
 
+import re
+from dataclasses import fields, replace
 from pathlib import Path
 
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import (
+    MarkdownHeaderTextSplitter,
+    RecursiveCharacterTextSplitter,
+)
 from loguru import logger
 
 from rag_agent.agent.state import ChunkMetadata, DocumentChunk
@@ -49,6 +56,29 @@ class DocumentChunker:
     # from being lost entirely. A common interview question.
     DEFAULT_CHUNK_SIZE = 512
     DEFAULT_CHUNK_OVERLAP = 50
+
+    # chunk_size / chunk_overlap are measured in *approximate tokens*
+    # (~4 characters each). A deterministic estimate is used instead of a
+    # real tokenizer so chunk boundaries — and therefore content-hash chunk
+    # IDs — are identical on every machine, with no model download needed.
+    CHARS_PER_TOKEN = 4
+
+    SUPPORTED_MARKDOWN_SUFFIXES = (".md", ".markdown")
+    SUPPORTED_PDF_SUFFIXES = (".pdf",)
+
+    # Metadata vocabulary (mirrors the ChunkMetadata docstring in state.py).
+    KNOWN_TOPICS = (
+        "ANN", "CNN", "RNN", "LSTM", "Seq2Seq",
+        "Autoencoder", "SOM", "BoltzmannMachine", "GAN",
+    )
+    BONUS_TOPICS = frozenset({"SOM", "BoltzmannMachine", "GAN"})
+    VALID_DIFFICULTIES = ("beginner", "intermediate", "advanced")
+    DEFAULT_TOPIC = "General"
+    DEFAULT_DIFFICULTY = "intermediate"
+    DEFAULT_TYPE = "concept_explanation"
+
+    # Markdown headers that start a new section (and so a new chunk).
+    MARKDOWN_HEADERS = (("#", "h1"), ("##", "h2"), ("###", "h3"))
 
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
@@ -96,13 +126,51 @@ class DocumentChunker:
         FileNotFoundError
             If the file does not exist at the given path.
         """
-        # TODO: implement
-        # 1. Validate file exists
-        # 2. Route to _chunk_pdf or _chunk_markdown based on suffix
-        # 3. Apply metadata_overrides
-        # 4. Generate chunk_ids using VectorStoreManager.generate_chunk_id
-        # 5. Return list[DocumentChunk]
-        raise NotImplementedError
+        file_path = Path(file_path)
+        if not file_path.is_file():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        suffix = file_path.suffix.lower()
+        if suffix in self.SUPPORTED_PDF_SUFFIXES:
+            raw_chunks = self._chunk_pdf(file_path, chunk_size, chunk_overlap)
+        elif suffix in self.SUPPORTED_MARKDOWN_SUFFIXES:
+            raw_chunks = self._chunk_markdown(file_path, chunk_size, chunk_overlap)
+        else:
+            supported = self.SUPPORTED_PDF_SUFFIXES + self.SUPPORTED_MARKDOWN_SUFFIXES
+            raise ValueError(
+                f"Unsupported file type '{suffix}' for {file_path.name}. "
+                f"Supported: {', '.join(supported)}"
+            )
+
+        base_metadata = self._infer_metadata(file_path, metadata_overrides)
+
+        chunks: list[DocumentChunk] = []
+        for raw in raw_chunks:
+            text = raw["text"].strip()
+            if not text:
+                continue
+            chunks.append(
+                DocumentChunk(
+                    chunk_id=VectorStoreManager.generate_chunk_id(
+                        base_metadata.source, text
+                    ),
+                    chunk_text=text,
+                    # Each chunk owns its metadata object (and its list).
+                    metadata=replace(
+                        base_metadata,
+                        related_topics=list(base_metadata.related_topics),
+                    ),
+                )
+            )
+
+        logger.info(
+            "Chunked '{}' -> {} chunk(s) | topic={} difficulty={}",
+            file_path.name,
+            len(chunks),
+            base_metadata.topic,
+            base_metadata.difficulty,
+        )
+        return chunks
 
     def chunk_files(
         self,
@@ -129,8 +197,16 @@ class DocumentChunker:
             Combined chunks from all files, preserving source attribution
             in each chunk's metadata.
         """
-        # TODO: implement — iterate and collect, handle per-file errors
-        raise NotImplementedError
+        all_chunks: list[DocumentChunk] = []
+        for file_path in file_paths:
+            try:
+                all_chunks.extend(
+                    self.chunk_file(Path(file_path), metadata_overrides)
+                )
+            except Exception as exc:
+                # One unreadable file must not abort the rest of the upload.
+                logger.error("Skipping '{}': {}", file_path, exc)
+        return all_chunks
 
     # -----------------------------------------------------------------------
     # Format-Specific Loaders
@@ -165,9 +241,27 @@ class DocumentChunker:
             Raw dicts with 'text' and 'page' keys before conversion
             to DocumentChunk objects.
         """
-        # TODO: implement using langchain_community.document_loaders.PyPDFLoader
-        # and langchain.text_splitter.RecursiveCharacterTextSplitter
-        raise NotImplementedError
+        pages = PyPDFLoader(str(file_path)).load()
+        total_pages = len(pages)
+
+        cleaned_pages = []
+        for page in pages:
+            page_index = page.metadata.get("page", 0)
+            text, hit_references = self._clean_pdf_text(
+                page.page_content,
+                allow_reference_cut=page_index >= total_pages / 2,
+            )
+            if text:
+                page.page_content = text
+                cleaned_pages.append(page)
+            if hit_references:
+                break  # everything after the reference list is noise
+
+        splitter = self._build_splitter(chunk_size, chunk_overlap)
+        return [
+            {"text": doc.page_content, "page": doc.metadata.get("page", 0) + 1}
+            for doc in splitter.split_documents(cleaned_pages)
+        ]
 
     def _chunk_markdown(
         self,
@@ -197,8 +291,57 @@ class DocumentChunker:
         list[dict]
             Raw dicts with 'text' and 'header' keys.
         """
-        # TODO: implement using langchain.text_splitter.MarkdownHeaderTextSplitter
-        raise NotImplementedError
+        markdown = file_path.read_text(encoding="utf-8")
+
+        # Pass 1: split on headers so each section stays in one piece.
+        # strip_headers=False keeps the topic name inside the chunk text,
+        # which helps the embedding capture what the chunk is about.
+        header_splitter = MarkdownHeaderTextSplitter(
+            headers_to_split_on=list(self.MARKDOWN_HEADERS),
+            strip_headers=False,
+        )
+        sections = header_splitter.split_text(markdown)
+
+        # Pass 2: only sections larger than chunk_size get split further.
+        splitter = self._build_splitter(chunk_size, chunk_overlap)
+
+        raw_chunks = []
+        for section in sections:
+            if not self._has_body_text(section.page_content):
+                continue  # a header with nothing under it is not a chunk
+            header = " > ".join(
+                section.metadata[key]
+                for _, key in self.MARKDOWN_HEADERS
+                if key in section.metadata
+            )
+            for piece in self._split_section(section.page_content, splitter, chunk_size):
+                raw_chunks.append({"text": piece, "header": header})
+        return raw_chunks
+
+    def _split_section(
+        self,
+        section: str,
+        splitter: RecursiveCharacterTextSplitter,
+        chunk_size: int,
+    ) -> list[str]:
+        """
+        Split one markdown section only if it exceeds chunk_size.
+
+        When it must be split, the header lines are split off first and
+        re-attached to every piece. Otherwise the header would be left as
+        a tiny orphan chunk and the later pieces would lose their topic.
+        """
+        if len(section) // self.CHARS_PER_TOKEN <= chunk_size:
+            return [section]
+
+        lines = section.splitlines()
+        body_start = next(
+            i for i, line in enumerate(lines)
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        header_block = "\n".join(lines[:body_start]).strip()
+        body = "\n".join(lines[body_start:])
+        return [f"{header_block}\n{piece}" for piece in splitter.split_text(body)]
 
     # -----------------------------------------------------------------------
     # Metadata Inference
@@ -231,6 +374,122 @@ class DocumentChunker:
         ChunkMetadata
             Populated metadata object.
         """
-        # TODO: implement filename parsing + override merging
-        # Bonus topics: SOM, BoltzmannMachine, GAN → set is_bonus=True
-        raise NotImplementedError
+        overrides = dict(overrides or {})
+
+        valid_keys = {f.name for f in fields(ChunkMetadata)}
+        unknown = set(overrides) - valid_keys
+        if unknown:
+            raise ValueError(
+                f"Unknown metadata override(s): {sorted(unknown)}. "
+                f"Valid keys: {sorted(valid_keys)}"
+            )
+
+        # --- Infer from the filename: <topic>_<difficulty>.<ext> ---
+        stem = file_path.stem
+        topic_part, _, last_part = stem.rpartition("_")
+        if topic_part and last_part.lower() in self.VALID_DIFFICULTIES:
+            difficulty = last_part.lower()
+        else:
+            topic_part, difficulty = stem, self.DEFAULT_DIFFICULTY
+
+        metadata = {
+            "topic": self._match_topic(topic_part) or self.DEFAULT_TOPIC,
+            "difficulty": difficulty,
+            "type": self.DEFAULT_TYPE,
+            "source": file_path.name,
+            "related_topics": [],
+        }
+
+        # --- Explicit overrides win over inference ---
+        metadata.update(overrides)
+
+        if isinstance(metadata["topic"], str):
+            # Accept "lstm" and store it as the canonical "LSTM".
+            metadata["topic"] = self._match_topic(metadata["topic"]) or metadata["topic"]
+
+        metadata["difficulty"] = str(metadata["difficulty"]).lower()
+        if metadata["difficulty"] not in self.VALID_DIFFICULTIES:
+            raise ValueError(
+                f"Invalid difficulty '{metadata['difficulty']}'. "
+                f"Expected one of {self.VALID_DIFFICULTIES}"
+            )
+
+        related = metadata["related_topics"]
+        if isinstance(related, str):
+            related = [t.strip() for t in related.split(",") if t.strip()]
+        metadata["related_topics"] = list(related)
+
+        # Bonus status follows the topic unless explicitly overridden.
+        if "is_bonus" not in overrides:
+            metadata["is_bonus"] = metadata["topic"] in self.BONUS_TOPICS
+
+        return ChunkMetadata(**metadata)
+
+    # -----------------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------------
+
+    def _build_splitter(
+        self, chunk_size: int, chunk_overlap: int
+    ) -> RecursiveCharacterTextSplitter:
+        """Build a recursive splitter that measures size in approximate tokens."""
+        return RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=lambda text: len(text) // self.CHARS_PER_TOKEN,
+        )
+
+    @staticmethod
+    def _normalise_key(text: str) -> str:
+        """Lower-case and strip punctuation so 'Seq_2_Seq' matches 'Seq2Seq'."""
+        return re.sub(r"[^a-z0-9]", "", text.lower())
+
+    def _match_topic(self, text: str) -> str | None:
+        """Return the canonical topic named by `text` (or by one of its
+        underscore-separated words), or None if no known topic matches."""
+        lookup = {self._normalise_key(t): t for t in self.KNOWN_TOPICS}
+        lookup["boltzmann"] = "BoltzmannMachine"
+
+        for candidate in [text, *text.split("_")]:
+            topic = lookup.get(self._normalise_key(candidate))
+            if topic:
+                return topic
+        return None
+
+    @staticmethod
+    def _has_body_text(section: str) -> bool:
+        """True if a markdown section has content beyond its header lines."""
+        return any(
+            line.strip() and not line.lstrip().startswith("#")
+            for line in section.splitlines()
+        )
+
+    @staticmethod
+    def _clean_pdf_text(
+        text: str, allow_reference_cut: bool
+    ) -> tuple[str, bool]:
+        """
+        Strip common academic-PDF noise from one page of extracted text.
+
+        Removes bare page-number lines and collapses runs of spaces. If
+        `allow_reference_cut` is set and a standalone 'References' heading
+        is found, everything from it onward is dropped.
+
+        Returns
+        -------
+        tuple[str, bool]
+            (cleaned text, whether a reference list was cut off)
+        """
+        kept_lines = []
+        hit_references = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if allow_reference_cut and re.fullmatch(
+                r"(references|bibliography)", stripped, flags=re.IGNORECASE
+            ):
+                hit_references = True
+                break
+            if re.fullmatch(r"\d{1,4}", stripped):
+                continue  # page number
+            kept_lines.append(re.sub(r"[ \t]+", " ", stripped))
+        return "\n".join(kept_lines).strip(), hit_references

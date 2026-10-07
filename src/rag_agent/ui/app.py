@@ -21,15 +21,21 @@ PEP 8 | OOP | Single Responsibility
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 import streamlit as st
+from langchain_core.messages import HumanMessage
 
 from rag_agent.agent.graph import get_compiled_graph
 from rag_agent.agent.state import AgentResponse
 from rag_agent.config import get_settings
 from rag_agent.corpus.chunker import DocumentChunker
 from rag_agent.vectorstore.store import VectorStoreManager
+
+
+ALL_FILTER = "All"
+DIFFICULTY_OPTIONS = [ALL_FILTER, "beginner", "intermediate", "advanced"]
 
 
 # ---------------------------------------------------------------------------
@@ -116,28 +122,92 @@ def render_ingestion_panel(
     """
     st.sidebar.header("📂 Corpus Ingestion")
 
-    # TODO: implement
-    # 1. st.sidebar.file_uploader(
-    #        "Upload study materials",
-    #        type=["pdf", "md"],
-    #        accept_multiple_files=True
-    #    )
-    #
-    # 2. "Ingest Documents" button — only enabled when files are selected
-    #
-    # 3. On button click:
-    #    a. Save uploaded files to a temp directory
-    #    b. chunker.chunk_files(file_paths)
-    #    c. store.ingest(chunks) → IngestionResult
-    #    d. Display result: st.success / st.warning / st.error
-    #       Show: "{result.ingested} chunks added, {result.skipped} duplicates skipped"
-    #    e. Refresh ingested documents list in session_state
-    #
-    # 4. Render ingested documents list below the uploader
-    #    For each document: show source name, topic, chunk count
-    #    Add a small "🗑 Remove" button per document that calls store.delete_document()
+    # Always show what is really in the store (it persists between restarts).
+    st.session_state.ingested_documents = store.list_documents()
 
-    st.sidebar.info("Upload .pdf or .md files to populate the corpus.")
+    # The uploader key changes after each ingestion, which clears the widget.
+    uploader_key = f"uploader_{st.session_state.get('uploader_nonce', 0)}"
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload study materials",
+        type=["pdf", "md"],
+        accept_multiple_files=True,
+        key=uploader_key,
+    )
+
+    if st.sidebar.button(
+        "Ingest Documents",
+        type="primary",
+        disabled=not uploaded_files,
+    ):
+        with st.spinner("Chunking and embedding documents..."):
+            result = _ingest_uploads(uploaded_files, store, chunker)
+        st.session_state.last_ingestion_result = result
+        st.session_state.uploader_nonce = st.session_state.get("uploader_nonce", 0) + 1
+        st.rerun()
+
+    _render_ingestion_result(st.session_state.last_ingestion_result)
+
+    # Ingested documents list, with a remove button for each.
+    docs = st.session_state.ingested_documents
+    if docs:
+        st.sidebar.subheader("Ingested documents")
+    for doc in docs:
+        name_col, button_col = st.sidebar.columns([5, 1])
+        name_col.markdown(
+            f"**{doc['source']}**  \n{doc['topic']} · {doc['chunk_count']} chunks"
+        )
+        if button_col.button("🗑", key=f"remove_{doc['source']}", help="Remove"):
+            store.delete_document(doc["source"])
+            if st.session_state.selected_document == doc["source"]:
+                st.session_state.selected_document = None
+            st.session_state.last_ingestion_result = None
+            st.rerun()
+
+    if not docs:
+        st.sidebar.info("Upload .pdf or .md files to populate the corpus.")
+
+
+def _ingest_uploads(uploaded_files, store: VectorStoreManager, chunker: DocumentChunker):
+    """
+    Save uploads to a temp directory, chunk them, and ingest the chunks.
+
+    The temp files keep their original names so each chunk's `source`
+    metadata matches what the user uploaded. Files that produce no chunks
+    (unreadable, unsupported, empty) are reported in result.errors.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        paths = []
+        for uploaded in uploaded_files:
+            path = Path(tmp_dir) / Path(uploaded.name).name  # drop any directories
+            path.write_bytes(uploaded.getbuffer())
+            paths.append(path)
+
+        chunks = chunker.chunk_files(paths)
+
+    result = store.ingest(chunks)
+
+    chunked_sources = {c.metadata.source for c in chunks}
+    for uploaded in uploaded_files:
+        if Path(uploaded.name).name not in chunked_sources:
+            result.errors.append(f"{uploaded.name}: no readable content found")
+    return result
+
+
+def _render_ingestion_result(result) -> None:
+    """Show the outcome of the last ingestion as success / warning / error."""
+    if result is None:
+        return
+
+    summary = f"{result.ingested} chunks added, {result.skipped} duplicates skipped"
+    if result.errors:
+        st.sidebar.error(f"{summary}, {len(result.errors)} error(s)")
+        with st.sidebar.expander("Error details"):
+            for message in result.errors:
+                st.caption(message)
+    elif result.ingested > 0:
+        st.sidebar.success(summary)
+    else:
+        st.sidebar.warning(f"Nothing new to add — {summary}")
 
 
 def render_corpus_stats(store: VectorStoreManager) -> None:
@@ -151,15 +221,14 @@ def render_corpus_stats(store: VectorStoreManager) -> None:
     ----------
     store : VectorStoreManager
     """
-    # TODO: implement
-    # stats = store.get_collection_stats()
-    # st.sidebar.metric("Total Chunks", stats["total_chunks"])
-    # st.sidebar.write("Topics:", ", ".join(stats["topics"]))
-    # if stats["bonus_topics_present"]:
-    #     st.sidebar.success("✅ Bonus topics present")
-    # else:
-    #     st.sidebar.warning("⚠️ No bonus topics yet")
-    pass
+    stats = store.get_collection_stats()
+    st.sidebar.divider()
+    st.sidebar.metric("Total Chunks", stats["total_chunks"])
+    st.sidebar.write("Topics:", ", ".join(stats["topics"]) or "none yet")
+    if stats["bonus_topics_present"]:
+        st.sidebar.success("✅ Bonus topics present")
+    else:
+        st.sidebar.warning("⚠️ No bonus topics yet")
 
 
 # ---------------------------------------------------------------------------
@@ -180,23 +249,45 @@ def render_document_viewer(store: VectorStoreManager) -> None:
     """
     st.subheader("📄 Document Viewer")
 
-    # TODO: implement
-    # 1. If no documents ingested: show placeholder message
-    #
-    # 2. st.selectbox("Select document", options=[doc["source"] for doc in docs])
-    #    Store selection in st.session_state["selected_document"]
-    #
-    # 3. On selection change: store.get_document_chunks(selected_source)
-    #
-    # 4. Render chunks in a scrollable container (st.container with fixed height)
-    #    For each chunk:
-    #    - Show metadata badge: topic | difficulty | type
-    #    - Show chunk text
-    #    - Show similarity score if this chunk was used in last response
-    #
-    # 5. Display chunk count and coverage summary below viewer
+    docs = st.session_state.ingested_documents
+    if not docs:
+        st.info("Ingest documents using the sidebar to view content here.")
+        return
 
-    st.info("Ingest documents using the sidebar to view content here.")
+    sources = [doc["source"] for doc in docs]
+    current = st.session_state.selected_document
+    index = sources.index(current) if current in sources else 0
+
+    # Separate widget key: the "selected_document" default is None, which
+    # is not a valid selectbox value.
+    selected = st.selectbox("Select document", options=sources, index=index,
+                            key="document_selectbox")
+    st.session_state.selected_document = selected
+
+    chunks = store.get_document_chunks(selected)
+    scores = st.session_state.get("last_retrieved_scores", {})
+
+    viewer = st.container(height=400)
+    with viewer:
+        for number, chunk in enumerate(chunks, start=1):
+            meta = chunk.metadata
+            st.markdown(
+                f"**Chunk {number}** · `{meta.topic}` · `{meta.difficulty}` "
+                f"· `{meta.type}`"
+            )
+            st.write(chunk.chunk_text)
+            if chunk.chunk_id in scores:
+                st.caption(f"🎯 Used in last response — similarity {scores[chunk.chunk_id]:.2f}")
+            st.divider()
+
+    word_counts = [len(c.chunk_text.split()) for c in chunks]
+    topics = sorted({c.metadata.topic for c in chunks})
+    if word_counts:
+        st.caption(
+            f"{len(chunks)} chunks · {sum(word_counts)} words "
+            f"(avg {sum(word_counts) // len(chunks)}/chunk) · "
+            f"topics: {', '.join(topics)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -221,13 +312,18 @@ def render_chat_interface(graph) -> None:
     st.subheader("💬 Interview Prep Chat")
 
     # Filters
+    topics = get_vector_store().get_collection_stats()["topics"]
     col_topic, col_diff = st.columns(2)
     with col_topic:
-        # TODO: st.selectbox for topic filter
-        pass
+        topic_choice = st.selectbox("Topic", [ALL_FILTER, *topics], key="topic_select")
     with col_diff:
-        # TODO: st.selectbox for difficulty filter
-        pass
+        difficulty_choice = st.selectbox(
+            "Difficulty", DIFFICULTY_OPTIONS, key="difficulty_select"
+        )
+    st.session_state.topic_filter = None if topic_choice == ALL_FILTER else topic_choice
+    st.session_state.difficulty_filter = (
+        None if difficulty_choice == ALL_FILTER else difficulty_choice
+    )
 
     # Chat history display
     chat_container = st.container(height=400)
@@ -243,22 +339,53 @@ def render_chat_interface(graph) -> None:
                     st.warning("⚠️ No relevant content found in corpus.")
 
     # Chat input
-    # TODO: implement
-    # 1. query = st.chat_input("Ask about a deep learning topic...")
-    #
-    # 2. On submit:
-    #    a. Append user message to chat_history
-    #    b. Display user message immediately (st.rerun or direct render)
-    #    c. Build LangGraph input:
-    #       {"messages": [HumanMessage(content=query)]}
-    #    d. config = {"configurable": {"thread_id": st.session_state.thread_id}}
-    #    e. result = graph.invoke(input, config=config)
-    #    f. response = result["final_response"]
-    #    g. Append assistant message with answer, sources, no_context_found flag
-    #
-    # STRETCH GOAL — streaming:
-    # Replace graph.invoke with graph.stream() and use st.write_stream()
-    # to display tokens as they arrive. Significant "wow factor" in Hour 3.
+    query = st.chat_input("Ask about a deep learning topic...")
+    if not query or not query.strip():
+        return
+
+    st.session_state.chat_history.append({"role": "user", "content": query})
+
+    # Per-turn fields are reset explicitly: the checkpointer keeps state
+    # between turns, so stale results from the last question must not leak in.
+    graph_input = {
+        "messages": [HumanMessage(content=query)],
+        "topic_filter": st.session_state.topic_filter,
+        "difficulty_filter": st.session_state.difficulty_filter,
+        "retrieved_chunks": [],
+        "no_context_found": False,
+        "final_response": None,
+    }
+    config = {"configurable": {"thread_id": st.session_state.thread_id}}
+
+    try:
+        with st.spinner("Thinking..."):
+            result = graph.invoke(graph_input, config=config)
+    except Exception as exc:  # LLM/API/connection failures should not crash the UI
+        st.session_state.chat_history.append(
+            {"role": "assistant", "content": f"⚠️ Something went wrong: {exc}"}
+        )
+        st.rerun()
+
+    response: AgentResponse | None = result.get("final_response")
+    if response is None:
+        st.session_state.chat_history.append(
+            {"role": "assistant", "content": "⚠️ The agent returned no response."}
+        )
+    else:
+        st.session_state.chat_history.append(
+            {
+                "role": "assistant",
+                "content": response.answer,
+                "sources": response.sources,
+                "no_context_found": response.no_context_found,
+            }
+        )
+
+    # Remember which chunks were used so the viewer can highlight them.
+    st.session_state.last_retrieved_scores = {
+        chunk.chunk_id: chunk.score for chunk in result.get("retrieved_chunks", [])
+    }
+    st.rerun()
 
 
 # ---------------------------------------------------------------------------

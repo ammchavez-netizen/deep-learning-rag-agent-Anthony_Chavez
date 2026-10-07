@@ -74,6 +74,7 @@ class Settings(BaseSettings):
     lmstudio_model: str = Field(default="local-model", alias="LMSTUDIO_MODEL")
 
     # Embeddings
+    openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     embedding_provider: EmbeddingProvider = EmbeddingProvider.LOCAL
     embedding_model: str = Field(
         default="all-MiniLM-L6-v2", alias="EMBEDDING_MODEL"
@@ -134,6 +135,11 @@ class LLMFactory:
     >>> response = llm.invoke("Explain backpropagation in one sentence.")
     """
 
+    # Low temperature keeps answers grounded in the retrieved context.
+    DEFAULT_TEMPERATURE = 0.0
+    # LM Studio ignores the key, but the OpenAI client requires a non-empty one.
+    LMSTUDIO_PLACEHOLDER_KEY = "lm-studio"
+
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
 
@@ -175,8 +181,20 @@ class LLMFactory:
         Interview talking point: Groq uses LPU (Language Processing Unit)
         inference for significantly lower latency than GPU-based inference.
         """
-        # TODO: implement using langchain_groq.ChatGroq
-        raise NotImplementedError
+        from langchain_groq import ChatGroq
+
+        api_key = self._settings.groq_api_key
+        if not api_key or api_key.startswith("your_"):
+            raise EnvironmentError(
+                "GROQ_API_KEY is missing. Add your key to .env "
+                "(get one free at https://console.groq.com)."
+            )
+
+        return ChatGroq(
+            model=self._settings.groq_model,
+            api_key=api_key,
+            temperature=self.DEFAULT_TEMPERATURE,
+        )
 
     def _create_ollama(self) -> BaseChatModel:
         """
@@ -188,8 +206,13 @@ class LLMFactory:
         Interview talking point: local inference eliminates data privacy
         concerns and removes API cost and latency entirely.
         """
-        # TODO: implement using langchain_ollama.ChatOllama
-        raise NotImplementedError
+        from langchain_ollama import ChatOllama
+
+        return ChatOllama(
+            model=self._settings.ollama_model,
+            base_url=self._settings.ollama_base_url,
+            temperature=self.DEFAULT_TEMPERATURE,
+        )
 
     def _create_lmstudio(self) -> BaseChatModel:
         """
@@ -205,8 +228,14 @@ class LLMFactory:
         OpenAI-native tooling to work with self-hosted models without
         code changes — just a base_url swap.
         """
-        # TODO: implement using langchain_openai.ChatOpenAI with base_url override
-        raise NotImplementedError
+        from langchain_openai import ChatOpenAI
+
+        return ChatOpenAI(
+            model=self._settings.lmstudio_model,
+            base_url=self._settings.lmstudio_base_url,
+            api_key=self.LMSTUDIO_PLACEHOLDER_KEY,
+            temperature=self.DEFAULT_TEMPERATURE,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +256,8 @@ class EmbeddingFactory:
     >>> embeddings = factory.create()
     >>> vector = embeddings.embed_query("What is backpropagation?")
     """
+
+    OPENAI_MODEL = "text-embedding-3-small"
 
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
@@ -265,8 +296,14 @@ class EmbeddingFactory:
         Interview talking point: local embeddings mean the corpus content
         never leaves the machine — important for proprietary datasets.
         """
-        # TODO: implement using langchain_community.embeddings.HuggingFaceEmbeddings
-        raise NotImplementedError
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+
+        return HuggingFaceEmbeddings(
+            model_name=self._settings.embedding_model,
+            # Normalised vectors make cosine similarity a simple dot product
+            # and keep scores consistent with ChromaDB's cosine space.
+            encode_kwargs={"normalize_embeddings": True},
+        )
 
     def _create_openai(self):
         """
@@ -275,5 +312,13 @@ class EmbeddingFactory:
         Requires OPENAI_API_KEY. Higher quality than local models
         but incurs API cost per embedding call.
         """
-        # TODO: implement using langchain_openai.OpenAIEmbeddings
-        raise NotImplementedError
+        from langchain_openai import OpenAIEmbeddings
+
+        api_key = self._settings.openai_api_key
+        if not api_key:
+            raise EnvironmentError(
+                "OPENAI_API_KEY is missing. Add it to .env or switch to "
+                "EMBEDDING_PROVIDER=local."
+            )
+
+        return OpenAIEmbeddings(model=self.OPENAI_MODEL, api_key=api_key)
